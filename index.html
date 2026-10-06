@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>smoke and mirrors</title>
+<meta name="description" content="Blow fake smoke from your webcam. Hand and face tracking puts a virtual cigarette between your fingers. Runs entirely in your browser.">
+<meta name="theme-color" content="#07070a">
+<meta name="color-scheme" content="dark">
+<meta property="og:title" content="smoke and mirrors">
+<meta property="og:description" content="Blow fake smoke from your webcam. Nothing leaves your device.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%A8%3C/text%3E%3C/svg%3E">
+<style>
+html,body{height:100%;margin:0;background:#07070a;overflow:hidden;touch-action:none}
+#cam,#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+#cam{object-fit:cover;transform:scaleX(-1);filter:brightness(.78) contrast(1.05)}
+#msg{position:fixed;left:0;right:0;bottom:0;padding:0 16px calc(18px + env(safe-area-inset-bottom,0px));text-align:center;font:italic 15px/1.4 Georgia,'Times New Roman',serif;color:#cfc9bd;text-shadow:0 1px 6px #000;pointer-events:none}
+#ns{position:fixed;inset:0;display:grid;place-items:center;padding:16px;text-align:center;font:italic 16px Georgia,serif;color:#cfc9bd}
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="c"></canvas>
+<div id="msg" role="status" aria-live="polite">starting camera…</div>
+<noscript><div id="ns">smoke and mirrors needs JavaScript and a camera.</div></noscript>
+<script type="module">
+import {FilesetResolver,FaceLandmarker,HandLandmarker} from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+const cam=document.getElementById('cam'),cv=document.getElementById('c'),ctx=cv.getContext('2d'),msg=document.getElementById('msg');
+let W,H,DPR=Math.min(devicePixelRatio||1,2);
+function size(){W=innerWidth;H=innerHeight;cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0)}
+size();addEventListener('resize',size);
+
+// smoke sprite + particles
+const spr=document.createElement('canvas');spr.width=spr.height=64;
+{const s=spr.getContext('2d'),g=s.createRadialGradient(32,32,0,32,32,32);
+ g.addColorStop(0,'rgba(255,255,255,1)');g.addColorStop(.4,'rgba(255,255,255,.45)');g.addColorStop(1,'rgba(255,255,255,0)');
+ s.fillStyle=g;s.fillRect(0,0,64,64)}
+const P=[],MAX=1600;let T=0;
+function emit(x,y,n,spd,big,dx,dy,k){
+  for(let i=0;i<n&&P.length<MAX;i++){
+    const a=Math.random()*6.283,s=Math.random()*spd*k;
+    P.push({x:x+(Math.random()-.5)*4*k,y:y+(Math.random()-.5)*4*k,
+      vx:Math.cos(a)*s+dx*k*(.5+Math.random()),vy:Math.sin(a)*s+dy*k*(.5+Math.random())-.2*k,
+      life:0,max:(big?190:150)+Math.random()*140,r:((big?10:5)+Math.random()*6)*k,g:((big?.9:.5)+Math.random()*.4)*k,ph:Math.random()*100});
+  }
+}
+
+// map normalized video landmark -> screen (mirrored, object-fit: cover)
+function map(l){
+  const vw=cam.videoWidth,vh=cam.videoHeight,sc=Math.max(W/vw,H/vh);
+  return {x:W-(l.x*vw*sc-(vw*sc-W)/2),y:l.y*vh*sc-(vh*sc-H)/2};
+}
+const mid=(a,b)=>({x:(a.x+b.x)/2,y:(a.y+b.y)/2}),dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+
+// camera
+async function startCam(){
+  if(!window.isSecureContext)throw Object.assign(new Error(),{name:'Insecure'});
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)throw Object.assign(new Error(),{name:'Unsupported'});
+  const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}},audio:false});
+  cam.srcObject=st;await cam.play();
+}
+let face=null,hand=null;
+async function loadModels(){
+  const fs=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const base='https://storage.googleapis.com/mediapipe-models/';
+  const mk=async(C,path,opts)=>{
+    try{return await C.createFromOptions(fs,{baseOptions:{modelAssetPath:base+path,delegate:'GPU'},runningMode:'VIDEO',...opts})}
+    catch(e){return await C.createFromOptions(fs,{baseOptions:{modelAssetPath:base+path},runningMode:'VIDEO',...opts})}
+  };
+  face=await mk(FaceLandmarker,'face_landmarker/face_landmarker/float16/1/face_landmarker.task',{numFaces:1,outputFaceBlendshapes:true});
+  hand=await mk(HandLandmarker,'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',{numHands:2});
+}
+
+// state
+let mouth=null,fw=240,jaw=0,hands=[],charge=0,lastT=-1,ptr=null;
+addEventListener('pointerdown',e=>{ptr={x:e.clientX,y:e.clientY}});
+addEventListener('pointermove',e=>{if(ptr)ptr={x:e.clientX,y:e.clientY}});
+addEventListener('pointerup',()=>ptr=null);
+addEventListener('pointercancel',()=>ptr=null);
+
+function detect(){
+  if(!face||!hand||cam.readyState<2||cam.currentTime===lastT)return;
+  lastT=cam.currentTime;const now=performance.now();
+  const f=face.detectForVideo(cam,now),h=hand.detectForVideo(cam,now+1);
+  if(f.faceLandmarks&&f.faceLandmarks[0]){
+    const L=f.faceLandmarks[0];mouth=map(mid(L[13],L[14]));fw=dist(map(L[234]),map(L[454]));
+    const bs=f.faceBlendshapes&&f.faceBlendshapes[0]?f.faceBlendshapes[0].categories:[];
+    const g=n=>{const c=bs.find(b=>b.categoryName===n);return c?c.score:0};
+    jaw=Math.max(g('jawOpen'),g('mouthFunnel')*.9);
+  }else{mouth=null;jaw=0}
+  // raw per-hand targets; smoothing happens in frame()
+  const L2=h.landmarks||[],HD=h.handednesses||h.handedness||[];
+  hands=L2.map((L,i)=>{
+    const hs=dist(map(L[0]),map(L[9]));
+    // grip: between index and middle finger, halfway from PIP to DIP joints
+    const g=mid(mid(map(L[6]),map(L[10])),mid(map(L[7]),map(L[11])));
+    const base=mid(map(L[5]),map(L[9]));
+    const key=(HD[i]&&HD[i][0]&&HD[i][0].categoryName)||('h'+i);
+    return {key,g,fang:Math.atan2(g.y-base.y,g.x-base.x),hs};
+  });
+  return true;
+}
+
+// persistent, smoothed cigarettes keyed by handedness
+const cigs=new Map();
+const wrap=a=>Math.atan2(Math.sin(a),Math.cos(a));
+function updateCigs(dt,ran){
+  const a=1-Math.pow(1-.35,dt);
+  const seen=new Set();
+  for(const r of hands){
+    seen.add(r.key);
+    let c=cigs.get(r.key);
+    // filter points toward the mouth when a face is visible, else along the fingers
+    const tang=mouth?Math.atan2(mouth.y-r.g.y,mouth.x-r.g.x):r.fang;
+    if(!c){c={gx:r.g.x,gy:r.g.y,ang:tang,len:r.hs*1.15,ember:.25,miss:0,vis:0};cigs.set(r.key,c)}
+    c.gx+=(r.g.x-c.gx)*a;c.gy+=(r.g.y-c.gy)*a;
+    c.ang+=wrap(tang-c.ang)*a;c.len+=(r.hs*1.15-c.len)*a;c.miss=0;
+  }
+  for(const [k,c] of cigs){
+    if(ran&&!seen.has(k)&&++c.miss>10){cigs.delete(k);continue}
+    c.vis+=((c.miss?0:1)-c.vis)*.2*dt;
+    const ux=Math.cos(c.ang),uy=Math.sin(c.ang),len=c.len;
+    const dm=mouth?Math.hypot(mouth.x-c.gx,mouth.y-c.gy):1e9;
+    // filter sticks out past the grip; when near the mouth it reaches exactly to the lips
+    const reach=dm<len*.6?Math.max(len*.1,Math.min(dm,len*.45)):len*.28;
+    c.close=dm<len*.5&&jaw<.2;
+    c.f={x:c.gx+ux*reach,y:c.gy+uy*reach};
+    c.e={x:c.f.x-ux*len,y:c.f.y-uy*len};
+    c.w=Math.max(len*.075,4);
+  }
+}
+
+function drawCig(c){
+  const s=c.f,e=c.e,w=c.w;ctx.lineCap='butt';ctx.globalAlpha=c.vis;
+  const fx=s.x+(e.x-s.x)*.25,fy=s.y+(e.y-s.y)*.25,ax=s.x+(e.x-s.x)*.95,ay=s.y+(e.y-s.y)*.95;
+  ctx.lineWidth=w;ctx.strokeStyle='#c98a4a';ctx.beginPath();ctx.moveTo(s.x,s.y);ctx.lineTo(fx,fy);ctx.stroke();
+  ctx.strokeStyle='#ece6d8';ctx.beginPath();ctx.moveTo(fx,fy);ctx.lineTo(ax,ay);ctx.stroke();
+  ctx.strokeStyle='#8a8580';ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(e.x,e.y);ctx.stroke();
+  const r=w*(3+c.ember*3),g=ctx.createRadialGradient(e.x,e.y,0,e.x,e.y,r);
+  g.addColorStop(0,`rgba(255,190,90,${.6+c.ember*.4})`);g.addColorStop(.4,`rgba(255,90,20,${.35+c.ember*.4})`);g.addColorStop(1,'rgba(255,60,0,0)');
+  ctx.globalCompositeOperation='lighter';ctx.fillStyle=g;ctx.fillRect(e.x-r,e.y-r,r*2,r*2);ctx.globalCompositeOperation='source-over';
+  ctx.globalAlpha=1;
+}
+
+let last=performance.now(),said=false;
+function frame(now){
+  const dt=Math.min((now-last)/16.67,3);last=now;T+=dt;
+  let ran=false;try{ran=!!detect()}catch(e){}
+  updateCigs(dt,ran);
+  const k=Math.max(.6,Math.min(fw/260,1.8));
+
+  // hand cigarettes: wisp from ember, inhale when filter is at the lips
+  let near=false;
+  for(const c of cigs.values()){
+    c.ember+=((c.close?1:.25)-c.ember)*.15;if(c.close)near=true;
+    if(c.vis>.5&&Math.random()<.8*dt)emit(c.e.x,c.e.y,1,.15,false,0,-.6,k);
+  }
+  charge=near?Math.min(charge+.02*dt,3):charge*(1-.002*dt);
+
+  // mouth exhale
+  if(mouth&&jaw>.18){
+    const n=Math.round((3+jaw*14*(1+charge))*dt);
+    emit(mouth.x,mouth.y,n,1.6,true,(Math.random()-.5)*1.2,1.4+jaw*2,k);
+    charge*=1-.02*dt;
+  }
+  // pointer fallback: press anywhere to blow smoke
+  if(ptr)emit(ptr.x,ptr.y,Math.round(4*dt),1.4,true,(Math.random()-.5),-1.2,1);
+
+  if(!said&&face&&hand){said=true;msg.textContent='hold two fingers up like a cigarette. bring it to your lips, then open your mouth to blow smoke.'}
+
+  for(let i=P.length-1;i>=0;i--){
+    const p=P[i];p.life+=dt;if(p.life>p.max){P[i]=P[P.length-1];P.pop();continue}
+    const q=p.life/p.max;
+    p.vx+=Math.sin(p.y*.012+T*.02+p.ph)*.018*dt;p.vy-=.006*dt*(1-q);
+    p.vx*=.992;p.vy*=.992;p.x+=p.vx*dt;p.y+=p.vy*dt;p.r+=p.g*.07*dt;
+  }
+  ctx.clearRect(0,0,W,H);
+  for(const p of P){
+    const q=p.life/p.max,a=Math.sin(Math.min(q*1.2,1)*Math.PI)*.075;
+    if(a<.003)continue;ctx.globalAlpha=a;ctx.drawImage(spr,p.x-p.r*2,p.y-p.r*2,p.r*4,p.r*4);
+  }
+  ctx.globalAlpha=1;
+  for(const c of cigs.values())drawCig(c);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&cam.srcObject&&cam.paused)cam.play().catch(()=>{})});
+
+(async()=>{
+  try{await startCam()}catch(e){
+    msg.textContent=({
+      NotAllowedError:'camera blocked. allow camera access and reload. press anywhere for smoke.',
+      NotFoundError:'no camera found. press anywhere for smoke.',
+      NotReadableError:'camera is busy in another app. close it and reload.',
+      Insecure:'camera needs https. open this page over https.',
+      Unsupported:'this browser can\'t use the camera. press anywhere for smoke.'
+    })[e.name]||'could not start camera. press anywhere for smoke.';
+    return;
+  }
+  msg.textContent='loading hand and face tracking…';
+  try{await loadModels()}catch(e){msg.textContent='could not load tracking models ('+(e.message||e)+'). press anywhere for smoke.'}
+})();
+</script>
+</body>
+</html>
